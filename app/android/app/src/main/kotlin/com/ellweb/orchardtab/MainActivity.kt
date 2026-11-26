@@ -1,6 +1,7 @@
 package com.ellweb.orchardtab
 
 import android.content.Context
+import android.media.AudioManager
 import android.os.Bundle
 import io.flutter.embedding.android.FlutterActivity
 
@@ -10,6 +11,8 @@ class MainActivity : FlutterActivity() {
         // engine opens a stream (same as hum_flutter's plugin).
         nativeInitAndroidContext(applicationContext)
         super.onCreate(savedInstanceState)
+        // hardware volume keys always control the music stream the engine plays on
+        volumeControlStream = AudioManager.STREAM_MUSIC
     }
 
     companion object {
