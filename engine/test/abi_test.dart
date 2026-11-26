@@ -7,5 +7,6 @@ void main() {
   test('struct layouts match Rust (rust/src/lib.rs abi_tests)', () {
     expect(sizeOf<OeNote>(), 12);
     expect(sizeOf<OeOscParams>(), 32);
+    expect(sizeOf<OeClip>(), 12);
   });
 }

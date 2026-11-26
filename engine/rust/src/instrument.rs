@@ -87,6 +87,9 @@ pub struct SoundFontInst {
     midi_ch: i32,
     pub bank: u16,
     pub program: u8,
+    /// MIDI key each pattern key was started on (+1, 0 = none): note offs
+    /// must hit the same key even if the channel pitch moved meanwhile.
+    sounding: [u8; 128],
 }
 
 impl SoundFontInst {
@@ -101,7 +104,7 @@ impl SoundFontInst {
             synth.process_midi_message(midi_ch, 0xB0, 0x00, bank as i32);
         }
         synth.process_midi_message(midi_ch, 0xC0, program as i32, 0);
-        Ok(Self { synth, midi_ch, bank, program })
+        Ok(Self { synth, midi_ch, bank, program, sounding: [0; 128] })
     }
 }
 
@@ -131,6 +134,11 @@ impl Instrument {
             Instrument::SoundFont(s) => {
                 let k = (key as f64 + ctx.pitch.round()).clamp(0.0, 127.0) as i32;
                 let v = ((vel * 127.0 / 128.0).round() as i32).clamp(1, 127);
+                let slot = &mut s.sounding[(key & 127) as usize];
+                if *slot != 0 && *slot as i32 - 1 != k {
+                    s.synth.note_off(s.midi_ch, *slot as i32 - 1);
+                }
+                *slot = k as u8 + 1;
                 s.synth.note_on(s.midi_ch, k, v);
             }
         }
@@ -141,8 +149,12 @@ impl Instrument {
             Instrument::Sampler(_) => {} // one-shot: plays to the end
             Instrument::Osc(o) => o.note_off(key),
             Instrument::SoundFont(s) => {
-                let k = (key as f64 + ctx.pitch.round()).clamp(0.0, 127.0) as i32;
-                s.synth.note_off(s.midi_ch, k);
+                let _ = ctx;
+                let slot = &mut s.sounding[(key & 127) as usize];
+                if *slot != 0 {
+                    s.synth.note_off(s.midi_ch, *slot as i32 - 1);
+                    *slot = 0;
+                }
             }
         }
     }
@@ -151,7 +163,10 @@ impl Instrument {
         match self {
             Instrument::Sampler(_) => {}
             Instrument::Osc(o) => o.all_off(),
-            Instrument::SoundFont(s) => s.synth.note_off_all(false),
+            Instrument::SoundFont(s) => {
+                s.synth.note_off_all(false);
+                s.sounding = [0; 128];
+            }
         }
     }
 

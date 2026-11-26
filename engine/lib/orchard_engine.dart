@@ -14,6 +14,18 @@ const int kMaxPatterns = 8;
 const int kMaxSteps = 64;
 const int kPpq = 96;
 const int kTicksPerStep = 24;
+const int kTicksPerBar = kPpq * 4;
+
+/// Mixer: insert 0 is the master, 1..16 the inserts.
+const int kMixerInserts = 17;
+const int kFxSlots = 4;
+const int kFxParams = 6;
+
+/// A Playlist clip in ticks.
+class EngineClip {
+  const EngineClip(this.start, this.len, this.pattern);
+  final int start, len, pattern;
+}
 
 /// Built-in kit, index = sample id in the engine (engine/rust/src/drumkit.rs).
 const List<String> kSounds = ['Kick', 'Clap', 'Hat', 'Open Hat', 'Snare', '808 Bass', 'Chord Stab'];
@@ -129,8 +141,63 @@ class OrchardEngine {
   void noteOff(int ch, int key) => b.oeNoteOff(_h, ch, key.clamp(0, 127));
   void collect() => b.oeCollect(_h);
 
-  void setChannel(int ch, {required double vol, required double pan, double pitch = 0, bool mute = false, bool used = true}) =>
-      b.oeSetChannel(_h, ch, vol, pan, pitch, mute, used);
+  void setChannel(int ch,
+          {required double vol,
+          required double pan,
+          double pitch = 0,
+          bool mute = false,
+          bool used = true,
+          int insert = 0}) =>
+      b.oeSetChannel(_h, ch, vol, pan, pitch, mute, used, insert);
+
+  void setSongMode(bool on) => b.oeSongMode(_h, on);
+
+  void setClips(List<EngineClip> clips) {
+    if (clips.isEmpty) {
+      b.oeSetClips(_h, nullptr, 0);
+      return;
+    }
+    final p = calloc<b.OeClip>(clips.length);
+    try {
+      for (var i = 0; i < clips.length; i++) {
+        (p + i).ref
+          ..start = clips[i].start
+          ..len = clips[i].len
+          ..pattern = clips[i].pattern;
+      }
+      b.oeSetClips(_h, p, clips.length);
+    } finally {
+      calloc.free(p);
+    }
+  }
+
+  void setInsert(int idx, {required double vol, required double pan, bool mute = false}) =>
+      b.oeSetInsert(_h, idx, vol, pan, mute);
+
+  /// [kind] = FxKind index (0 reverb .. 4 compressor), null clears the slot.
+  void setFx(int ins, int slot, int? kind, [List<double>? params]) {
+    if (kind == null) {
+      b.oeSetFx(_h, ins, slot, 255, nullptr);
+      return;
+    }
+    final p = params == null ? nullptr : calloc<Float>(kFxParams);
+    try {
+      if (params != null) {
+        for (var i = 0; i < kFxParams; i++) {
+          p[i] = i < params.length ? params[i] : 0;
+        }
+      }
+      b.oeSetFx(_h, ins, slot, kind, p);
+    } finally {
+      if (p != nullptr) calloc.free(p);
+    }
+  }
+
+  void setFxParam(int ins, int slot, int param, double value) => b.oeFxParam(_h, ins, slot, param, value);
+  void setFxBypass(int ins, int slot, bool bypass) => b.oeFxBypass(_h, ins, slot, bypass);
+
+  /// Insert peak after its fader since last read (0 = master).
+  double takeInsertPeak(int idx) => b.oeTakeInsertPeak(_h, idx);
 
   void setNotes(int pat, int ch, List<EngineNote> notes) {
     if (notes.isEmpty) {

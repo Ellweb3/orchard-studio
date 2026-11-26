@@ -6,6 +6,7 @@
 
 pub mod drumkit;
 pub mod engine;
+pub mod fx;
 pub mod instrument;
 pub mod laws;
 mod output;
@@ -20,7 +21,8 @@ use std::sync::atomic::Ordering;
 
 use rustysynth::SoundFont;
 
-use engine::{Cmd, Garbage, MAX_CH, Note, Status};
+use engine::{Clip, Cmd, Garbage, MAX_CH, Note, Status};
+use fx::{Effect, FxKind};
 use instrument::{Instrument, Sampler, SoundFontInst};
 use threeosc::OscParams;
 
@@ -144,9 +146,83 @@ pub unsafe extern "C" fn oe_set_notes(h: *mut OeHandle, pat: u8, ch: u8, notes: 
     send(h, Cmd::Notes { pat, ch, notes: list })
 }
 
+/// `insert`: mixer insert (0 = master).
 #[unsafe(no_mangle)]
-pub extern "C" fn oe_set_channel(h: *mut OeHandle, ch: u8, vol: f32, pan: f32, pitch: f32, mute: bool, used: bool) -> bool {
-    send(h, Cmd::Channel { ch, vol, pan, pitch, mute, used })
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn oe_set_channel(
+    h: *mut OeHandle,
+    ch: u8,
+    vol: f32,
+    pan: f32,
+    pitch: f32,
+    mute: bool,
+    used: bool,
+    insert: u8,
+) -> bool {
+    send(h, Cmd::Channel { ch, vol, pan, pitch, mute, used, insert })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn oe_song_mode(h: *mut OeHandle, on: bool) -> bool {
+    send(h, Cmd::SongMode(on))
+}
+
+/// Replaces the Playlist clips (copied).
+///
+/// # Safety
+/// `clips` must point to `count` valid `Clip`s (or be null with count 0).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oe_set_clips(h: *mut OeHandle, clips: *const Clip, count: u32) -> bool {
+    let list: Box<[Clip]> = if clips.is_null() || count == 0 {
+        Box::default()
+    } else {
+        unsafe { std::slice::from_raw_parts(clips, count as usize) }.to_vec().into_boxed_slice()
+    };
+    send(h, Cmd::Clips(list))
+}
+
+/// Mixer insert `idx` (0 = master): fader 0..1 (0.8 = 0 dB), pan -1..1.
+#[unsafe(no_mangle)]
+pub extern "C" fn oe_set_insert(h: *mut OeHandle, idx: u8, vol: f32, pan: f32, mute: bool) -> bool {
+    send(h, Cmd::Insert { idx, vol, pan, mute })
+}
+
+/// Puts a new effect of `kind` (fx::FxKind) in a slot, or clears it (kind 255).
+/// `params` (6 floats, 0..1) may be null for the defaults.
+///
+/// # Safety
+/// `params` must be null or point to 6 floats.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oe_set_fx(h: *mut OeHandle, ins: u8, slot: u8, kind: u8, params: *const f32) -> bool {
+    let Some(hh) = handle(h) else { return false };
+    let fx = FxKind::from_u8(kind).map(|k| {
+        let mut e = Effect::new(k, hh.sr as f32);
+        if !params.is_null() {
+            let p = unsafe { std::slice::from_raw_parts(params, fx::MAX_PARAMS) };
+            for (i, v) in p.iter().enumerate() {
+                e.set(i, *v);
+            }
+        }
+        Box::new(e)
+    });
+    send(h, Cmd::Fx { ins, slot, fx })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn oe_fx_param(h: *mut OeHandle, ins: u8, slot: u8, param: u8, value: f32) -> bool {
+    send(h, Cmd::FxParam { ins, slot, param, value })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn oe_fx_bypass(h: *mut OeHandle, ins: u8, slot: u8, bypass: bool) -> bool {
+    send(h, Cmd::FxBypass { ins, slot, bypass })
+}
+
+/// Mixer insert peak (post fader) since the previous call, then resets it.
+#[unsafe(no_mangle)]
+pub extern "C" fn oe_take_insert_peak(h: *mut OeHandle, idx: u32) -> f32 {
+    let Some(h) = handle(h) else { return 0.0 };
+    h.status.ins_peaks.get(idx as usize).map_or(0.0, |p| f32::from_bits(p.swap(0, Ordering::Relaxed)))
 }
 
 #[unsafe(no_mangle)]
@@ -249,7 +325,10 @@ pub unsafe extern "C" fn oe_sf_preset_info(
         return false;
     }
     let s = p.get_name().trim_end_matches('\0').trim().as_bytes();
-    let n = s.len().min(cap as usize - 1);
+    let mut n = s.len().min(cap as usize - 1);
+    while n > 0 && n < s.len() && (s[n] & 0xC0) == 0x80 {
+        n -= 1; // don't cut a UTF-8 sequence
+    }
     unsafe {
         ptr::copy_nonoverlapping(s.as_ptr(), name, n);
         *name.add(n) = 0;
@@ -353,6 +432,7 @@ mod abi_tests {
     #[test]
     fn struct_layouts() {
         assert_eq!(std::mem::size_of::<super::Note>(), 12);
+        assert_eq!(std::mem::size_of::<super::Clip>(), 12);
         assert_eq!(std::mem::size_of::<super::OscParams>(), 32);
         assert_eq!(std::mem::offset_of!(super::OscParams, attack), 16);
     }

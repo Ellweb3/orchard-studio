@@ -7,6 +7,7 @@ import 'package:orchard_engine/orchard_engine.dart';
 import 'package:path_provider/path_provider.dart';
 
 import 'instruments.dart';
+import 'song.dart';
 
 const double kDefaultVolume = 100 / 128; // FL default channel volume (-5.2 dB)
 const int kDefaultVelocity = 100;
@@ -35,8 +36,19 @@ class ChannelData {
   bool mute = false;
   bool solo = false;
 
-  Map<String, dynamic> toJson() =>
-      {'inst': inst.toJson(), 'name': name, 'vol': vol, 'pan': pan, 'pitch': pitch, 'mute': mute, 'solo': solo};
+  /// Mixer insert (0 = master).
+  int insert = 0;
+
+  Map<String, dynamic> toJson() => {
+        'inst': inst.toJson(),
+        'name': name,
+        'vol': vol,
+        'pan': pan,
+        'pitch': pitch,
+        'mute': mute,
+        'solo': solo,
+        'insert': insert,
+      };
 
   factory ChannelData.fromJson(Map<String, dynamic> j) {
     // v1 files: {'sample': n}
@@ -51,7 +63,8 @@ class ChannelData {
       pitch: (j['pitch'] as num?)?.toDouble() ?? 0,
     )
       ..mute = j['mute'] as bool? ?? false
-      ..solo = j['solo'] as bool? ?? false;
+      ..solo = j['solo'] as bool? ?? false
+      ..insert = ((j['insert'] as num?)?.toInt() ?? 0).clamp(0, kMixerInserts - 1);
   }
 }
 
@@ -74,6 +87,12 @@ class Project extends ChangeNotifier {
   final List<List<List<NoteData>>> notes =
       List.generate(kMaxPatterns, (_) => List.generate(kMaxChannels, (_) => <NoteData>[]));
 
+  /// Song mode (FL's SONG switch): the Playlist plays instead of the pattern.
+  bool songMode = false;
+  final List<ClipData> clips = [];
+  final List<bool> trackMute = List.filled(kPlaylistTracks, false);
+  final List<InsertData> inserts = List.generate(kMixerInserts, (_) => InsertData());
+
   Timer? _saveTimer;
 
   // ------------------------------------------------------------ engine sync
@@ -84,7 +103,8 @@ class Project extends ChangeNotifier {
       return;
     }
     final c = channels[i];
-    engine.setChannel(i, vol: c.vol, pan: c.pan, pitch: c.pitch, mute: c.mute || (anySolo && !c.solo), used: true);
+    engine.setChannel(i,
+        vol: c.vol, pan: c.pan, pitch: c.pitch, mute: c.mute || (anySolo && !c.solo), used: true, insert: c.insert);
   }
 
   void _syncAllChannels() {
@@ -108,13 +128,34 @@ class Project extends ChangeNotifier {
     }
   }
 
+  void _syncClips() =>
+      engine.setClips([for (final c in clips) if (!trackMute[c.track]) c.toEngine()]);
+
+  void _syncInsert(int i) {
+    final ins = inserts[i];
+    engine.setInsert(i, vol: i == 0 ? master : ins.vol, pan: ins.pan, mute: ins.mute);
+  }
+
+  void _syncFx(int i, int slot) {
+    final f = inserts[i].fx[slot];
+    engine.setFx(i, slot, f?.kind, f?.params);
+    if (f != null && f.bypass) engine.setFxBypass(i, slot, true);
+  }
+
   void syncAll() {
     engine
       ..setTempo(tempo)
       ..setSwing(swing)
-      ..setMaster(master)
       ..setMetronome(metronome)
-      ..selectPattern(pattern);
+      ..selectPattern(pattern)
+      ..setSongMode(songMode);
+    for (var i = 0; i < kMixerInserts; i++) {
+      _syncInsert(i);
+      for (var s = 0; s < kFxSlots; s++) {
+        _syncFx(i, s);
+      }
+    }
+    _syncClips();
     for (var i = 0; i < channels.length; i++) {
       _syncInstrument(i);
     }
@@ -163,8 +204,97 @@ class Project extends ChangeNotifier {
 
   void setMaster(double v) {
     master = v.clamp(0, 1);
-    engine.setMaster(master);
+    inserts[0].vol = master;
+    _syncInsert(0);
     _changed();
+  }
+
+  // ---------------------------------------------------------------- song
+  void setSongMode(bool on) {
+    songMode = on;
+    engine.setSongMode(on);
+    _changed();
+  }
+
+  /// Bars the pattern takes (at least one).
+  int patternBars(int p) => ((patternLength[p] + 15) ~/ 16).clamp(1, 4);
+
+  ClipData? clipAt(int track, int bar) {
+    for (final c in clips.reversed) {
+      if (c.track == track && bar >= c.start && bar < c.end) return c;
+    }
+    return null;
+  }
+
+  ClipData addClip(int track, int bar, int pat) {
+    final c = ClipData(track, bar, patternBars(pat), pat);
+    clips.add(c);
+    _syncClips();
+    _changed();
+    return c;
+  }
+
+  void removeClip(ClipData c) {
+    clips.remove(c);
+    _syncClips();
+    _changed();
+  }
+
+  void clipChanged() {
+    _syncClips();
+    _changed();
+  }
+
+  void toggleTrackMute(int t) {
+    trackMute[t] = !trackMute[t];
+    _syncClips();
+    _changed();
+  }
+
+  int get songBars => clips.fold(0, (m, c) => c.end > m ? c.end : m);
+
+  // ---------------------------------------------------------------- mixer
+  void updateInsert(int i, void Function(InsertData d) f) {
+    f(inserts[i]);
+    if (i == 0) master = inserts[0].vol;
+    _syncInsert(i);
+    _changed();
+  }
+
+  void setFx(int i, int slot, int? kind) {
+    inserts[i].fx[slot] = kind == null ? null : FxData(kind);
+    _syncFx(i, slot);
+    _changed();
+  }
+
+  void setFxParam(int i, int slot, int param, double v) {
+    final f = inserts[i].fx[slot];
+    if (f == null) return;
+    f.params[param] = v.clamp(0, 1);
+    engine.setFxParam(i, slot, param, f.params[param]);
+    _changed();
+  }
+
+  void setFxBypass(int i, int slot, bool b) {
+    final f = inserts[i].fx[slot];
+    if (f == null) return;
+    f.bypass = b;
+    engine.setFxBypass(i, slot, b);
+    _changed();
+  }
+
+  /// Names of the channels routed to insert [i].
+  String insertLabel(int i) {
+    if (i == 0) return 'Master';
+    final names = [for (final c in channels) if (c.insert == i) c.name];
+    return names.isEmpty ? 'Insert $i' : names.join(', ');
+  }
+
+  int _freeInsert() {
+    for (var i = 1; i < kMixerInserts; i++) {
+      if (!channels.any((c) => c.insert == i)) return i;
+    }
+    return 0;
   }
 
   void toggleMetronome() {
@@ -246,7 +376,7 @@ class Project extends ChangeNotifier {
 
   void addChannel(InstrumentSpec inst) {
     if (!canAddChannel) return;
-    channels.add(ChannelData(inst));
+    channels.add(ChannelData(inst)..insert = _freeInsert());
     final i = channels.length - 1;
     _syncInstrument(i);
     _syncChannel(i);
@@ -292,7 +422,11 @@ class Project extends ChangeNotifier {
 
   // ----------------------------------------------------------- persistence
   Map<String, dynamic> toJson() => {
-        'version': 2,
+        'version': 3,
+        'songMode': songMode,
+        'clips': clips.map((c) => c.toJson()).toList(),
+        'trackMute': trackMute,
+        'inserts': inserts.map((i) => i.toJson()).toList(),
         'tempo': tempo,
         'swing': swing,
         'master': master,
@@ -312,6 +446,22 @@ class Project extends ChangeNotifier {
     swing = (j['swing'] as num?)?.toDouble() ?? 0;
     master = (j['master'] as num?)?.toDouble() ?? 0.8;
     metronome = j['metronome'] as bool? ?? false;
+    songMode = j['songMode'] as bool? ?? false;
+    clips
+      ..clear()
+      ..addAll(((j['clips'] as List?) ?? const []).map((c) => ClipData.fromJson(c as List)).where(
+          (c) => c.track < kPlaylistTracks && c.pattern < kMaxPatterns && c.len > 0 && c.start >= 0));
+    final tm = (j['trackMute'] as List?) ?? const [];
+    for (var t = 0; t < kPlaylistTracks; t++) {
+      trackMute[t] = t < tm.length && tm[t] == true;
+    }
+    final ins = (j['inserts'] as List?) ?? const [];
+    for (var i = 0; i < kMixerInserts; i++) {
+      inserts[i] = InsertData();
+      if (i < ins.length && ins[i] is Map) inserts[i].loadJson((ins[i] as Map).cast<String, dynamic>());
+    }
+    if (ins.isEmpty) inserts[0].vol = master;
+    master = inserts[0].vol;
     pattern = ((j['pattern'] as num?)?.toInt() ?? 0).clamp(0, kMaxPatterns - 1);
     final lens = (j['patternLength'] as List?)?.cast<num>() ?? const [];
     for (var p = 0; p < kMaxPatterns; p++) {
@@ -356,6 +506,13 @@ class Project extends ChangeNotifier {
         ChannelData(const InstrumentSpec.sampler(4)),
         ChannelData(const InstrumentSpec.soundfont(0, 0, 'Piano')),
       ]);
+    for (var i = 0; i < channels.length; i++) {
+      channels[i].insert = i + 1; // one insert per channel
+    }
+    // a starter song: the beat for 4 bars
+    clips
+      ..clear()
+      ..add(ClipData(0, 0, 4, 0));
     for (final s in [0, 4, 8, 12]) {
       notes[0][0].add(NoteData(s * kTicksPerStep, 0, kStepKey));
     }

@@ -1,28 +1,37 @@
-//! The real-time engine: transport, patterns of notes per channel (steps are
-//! zero-length notes on C5, as in src/engine/Sequencer.ts), swing, channel
-//! instruments (Sampler / 3x Osc / SoundFont), channel volume + pan, master,
-//! metronome.
+//! The real-time engine: transport (pattern / song mode), patterns of notes
+//! per channel (steps are zero-length notes on C5, as in
+//! src/engine/Sequencer.ts), Playlist clips, swing, channel instruments
+//! (Sampler / 3x Osc / SoundFont), the Mixer (inserts with FX slots routed to
+//! the master) and the metronome.
+//!
+//! Pattern mode is song mode with one implicit clip that spans the current
+//! pattern, so both share one scheduler. As in FL, notes are cut at the end
+//! of their clip.
 //!
 //! Real-time rules (as in flutter_audio_fx / hum_cpal): `process` never
 //! allocates, frees, locks or does I/O. The UI sends `Cmd`s over a lock-free
-//! rtrb queue; anything the audio thread replaces (note lists, instruments)
-//! goes back to the UI thread as `Garbage` to be dropped there.
+//! rtrb queue; anything the audio thread replaces (note lists, instruments,
+//! clips, effects) goes back to the UI thread as `Garbage` to be dropped there.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use crate::drumkit::{self, Sample};
+use crate::fx::Effect;
 use crate::instrument::{Ctx, Instrument, Sampler};
 use crate::laws;
 
 pub const MAX_CH: usize = 16;
 pub const MAX_PAT: usize = 8;
 pub const MAX_STEPS: usize = 64;
+/// Mixer: insert 0 is the master, 1..=16 the inserts.
+pub const MAX_INS: usize = 17;
+pub const FX_SLOTS: usize = 4;
 pub const PPQ: f64 = 96.0;
 pub const STEPS_PER_BEAT: f64 = 4.0;
 pub const TICKS_PER_STEP: f64 = PPQ / STEPS_PER_BEAT; // 24
 const BLOCK: usize = 64;
-const MAX_EVENTS: usize = 1024;
+const MAX_EVENTS: usize = 4096;
 const METRO_CH: u8 = u8::MAX;
 
 /// A note in a pattern. `len == 0` is a step (one-shot; synths hold it one step).
@@ -35,33 +44,53 @@ pub struct Note {
     pub vel: u8,
 }
 
+/// A Playlist pattern clip (ticks). The pattern repeats inside a longer clip.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Clip {
+    pub start: u32,
+    pub len: u32,
+    pub pattern: u8,
+}
+
 pub enum Cmd {
     Tempo(f64),
     Swing(f32),
     Master(f32),
     Play(bool),
     Metronome(bool),
+    SongMode(bool),
+    Clips(Box<[Clip]>),
     Notes { pat: u8, ch: u8, notes: Box<[Note]> },
-    Channel { ch: u8, vol: f32, pan: f32, pitch: f32, mute: bool, used: bool },
+    Channel { ch: u8, vol: f32, pan: f32, pitch: f32, mute: bool, used: bool, insert: u8 },
     Instrument { ch: u8, inst: Box<Instrument> },
     PatternLen { pat: u8, steps: u8 },
     SelectPattern(u8),
     NoteOn { ch: u8, key: u8, vel: u8 },
     NoteOff { ch: u8, key: u8 },
+    Insert { idx: u8, vol: f32, pan: f32, mute: bool },
+    Fx { ins: u8, slot: u8, fx: Option<Box<Effect>> },
+    FxParam { ins: u8, slot: u8, param: u8, value: f32 },
+    FxBypass { ins: u8, slot: u8, bypass: bool },
 }
 
 /// Heap data the audio thread let go of; dropped on the UI thread.
+#[allow(dead_code)]
 pub enum Garbage {
-    Notes(#[allow(dead_code)] Box<[Note]>),
-    Inst(#[allow(dead_code)] Box<Instrument>),
+    Notes(Box<[Note]>),
+    Inst(Box<Instrument>),
+    Clips(Box<[Clip]>),
+    Fx(Box<Effect>),
 }
 
 /// Engine -> UI, read lock-free by the FFI getters.
 pub struct Status {
-    pub pos_ticks: AtomicU64, // f64 bits, pattern-local
+    pub pos_ticks: AtomicU64, // f64 bits: pattern-local, or song position in song mode
     pub playing: AtomicBool,
     /// Peak |x| since last read, f32 bits (positive floats order like u32): [ch..., master].
     pub peaks: [AtomicU32; MAX_CH + 1],
+    /// Mixer insert peaks after fader (0 = master).
+    pub ins_peaks: [AtomicU32; MAX_INS],
     pub sample_rate: AtomicU32,
 }
 
@@ -71,6 +100,7 @@ impl Status {
             pos_ticks: AtomicU64::new(0),
             playing: AtomicBool::new(false),
             peaks: std::array::from_fn(|_| AtomicU32::new(0)),
+            ins_peaks: std::array::from_fn(|_| AtomicU32::new(0)),
             sample_rate: AtomicU32::new(0),
         }
     }
@@ -88,6 +118,7 @@ struct Channel {
     pan: f64,
     pitch: f64,
     mute: bool,
+    insert: usize,
     inst: Option<Box<Instrument>>,
     /// Keys started by the sequencer and not yet released (bitset).
     held: [u64; 2],
@@ -95,7 +126,23 @@ struct Channel {
 
 impl Default for Channel {
     fn default() -> Self {
-        Self { used: false, vol: 100.0 / 128.0, pan: 0.0, pitch: 0.0, mute: false, inst: None, held: [0; 2] }
+        Self { used: false, vol: 100.0 / 128.0, pan: 0.0, pitch: 0.0, mute: false, insert: 0, inst: None, held: [0; 2] }
+    }
+}
+
+struct Insert {
+    vol: f32,
+    pan: f32,
+    mute: bool,
+    fx: [Option<Box<Effect>>; FX_SLOTS],
+    l: [f32; BLOCK],
+    r: [f32; BLOCK],
+    peak: f32,
+}
+
+impl Default for Insert {
+    fn default() -> Self {
+        Self { vol: 0.8, pan: 0.0, mute: false, fx: Default::default(), l: [0.0; BLOCK], r: [0.0; BLOCK], peak: 0.0 }
     }
 }
 
@@ -115,13 +162,15 @@ pub struct Engine {
     click_lo: usize,
     metro: Sampler,
     channels: Vec<Channel>,
+    inserts: Vec<Insert>,
     /// notes[pat][ch], sorted by pos.
     notes: Vec<Vec<Box<[Note]>>>,
     pat_len: [usize; MAX_PAT],
     pattern: usize,
+    clips: Box<[Clip]>,
+    song_mode: bool,
     tempo: f64,
     swing: f64,
-    master: f64,
     playing: bool,
     metronome: bool,
     pos: f64,
@@ -153,12 +202,14 @@ impl Engine {
             click_lo,
             metro: Sampler::new(click_hi),
             channels: (0..MAX_CH).map(|_| Channel::default()).collect(),
+            inserts: (0..MAX_INS).map(|_| Insert::default()).collect(),
             notes: (0..MAX_PAT).map(|_| (0..MAX_CH).map(|_| Box::<[Note]>::default()).collect()).collect(),
             pat_len: [16; MAX_PAT],
             pattern: 0,
+            clips: Box::default(),
+            song_mode: false,
             tempo: 130.0,
             swing: 0.0,
-            master: 0.8,
             playing: false,
             metronome: false,
             pos: 0.0,
@@ -216,11 +267,25 @@ impl Engine {
         }
     }
 
+    fn loop_len(&self) -> f64 {
+        if self.song_mode {
+            let end = self.clips.iter().map(|c| c.start + c.len).max().unwrap_or(0) as f64;
+            // empty song: one silent bar, so the transport still runs
+            if end > 0.0 { end } else { PPQ * 4.0 }
+        } else {
+            self.pattern_ticks(self.pattern)
+        }
+    }
+
     pub fn handle(&mut self, cmd: Cmd) {
         match cmd {
-            Cmd::Tempo(t) => self.tempo = t.clamp(10.0, 522.0),
-            Cmd::Swing(s) => self.swing = (s as f64).clamp(0.0, 1.0),
-            Cmd::Master(m) => self.master = (m as f64).clamp(0.0, 1.0),
+            Cmd::Tempo(t) => {
+                if t.is_finite() {
+                    self.tempo = t.clamp(10.0, 522.0)
+                }
+            }
+            Cmd::Swing(s) => self.swing = if s.is_finite() { (s as f64).clamp(0.0, 1.0) } else { 0.0 },
+            Cmd::Master(m) => self.inserts[0].vol = if m.is_finite() { m.clamp(0.0, 1.0) } else { 0.0 },
             Cmd::Play(p) => {
                 if !p || !self.playing {
                     self.pos = 0.0;
@@ -231,25 +296,42 @@ impl Engine {
                 self.playing = p;
             }
             Cmd::Metronome(m) => self.metronome = m,
+            Cmd::SongMode(on) => {
+                if on != self.song_mode {
+                    self.release_all_sequenced();
+                    self.song_mode = on;
+                    self.pos = 0.0;
+                }
+            }
+            Cmd::Clips(clips) => {
+                if self.song_mode {
+                    self.release_all_sequenced();
+                }
+                let old = std::mem::replace(&mut self.clips, clips);
+                self.discard(Garbage::Clips(old));
+                if self.song_mode {
+                    self.pos %= self.loop_len();
+                }
+            }
             Cmd::Notes { pat, ch, notes } => {
                 let (p, c) = (pat as usize, ch as usize);
                 if p < MAX_PAT && c < MAX_CH {
-                    if p == self.pattern {
-                        self.release_sequenced(c);
-                    }
+                    self.release_sequenced(c);
                     let old = std::mem::replace(&mut self.notes[p][c], notes);
                     self.discard(Garbage::Notes(old));
                 } else {
                     self.discard(Garbage::Notes(notes));
                 }
             }
-            Cmd::Channel { ch, vol, pan, pitch, mute, used } => {
+            Cmd::Channel { ch, vol, pan, pitch, mute, used, insert } => {
                 if let Some(c) = self.channels.get_mut(ch as usize) {
+                    let fin = |v: f32, d: f64| if v.is_finite() { v as f64 } else { d };
                     c.used = used;
-                    c.vol = vol as f64;
-                    c.pan = pan as f64;
-                    c.pitch = pitch as f64;
+                    c.vol = fin(vol, 0.0);
+                    c.pan = fin(pan, 0.0);
+                    c.pitch = fin(pitch, 0.0);
                     c.mute = mute;
+                    c.insert = (insert as usize).min(MAX_INS - 1);
                 }
             }
             Cmd::Instrument { ch, inst } => {
@@ -267,19 +349,50 @@ impl Engine {
                 if let Some(l) = self.pat_len.get_mut(pat as usize) {
                     *l = (steps as usize).clamp(1, MAX_STEPS);
                 }
-                if pat as usize == self.pattern {
-                    self.pos %= self.pattern_ticks();
+                if !self.song_mode && pat as usize == self.pattern {
+                    self.pos %= self.loop_len();
                 }
             }
             Cmd::SelectPattern(p) => {
                 if (p as usize) < MAX_PAT && p as usize != self.pattern {
-                    self.release_all_sequenced();
+                    if !self.song_mode {
+                        self.release_all_sequenced();
+                    }
                     self.pattern = p as usize;
-                    self.pos %= self.pattern_ticks();
+                    if !self.song_mode {
+                        self.pos %= self.loop_len();
+                    }
                 }
             }
             Cmd::NoteOn { ch, key, vel } => self.live(ch, key, Some(vel)),
             Cmd::NoteOff { ch, key } => self.live(ch, key, None),
+            Cmd::Insert { idx, vol, pan, mute } => {
+                if let Some(i) = self.inserts.get_mut(idx as usize) {
+                    i.vol = if vol.is_finite() { vol.clamp(0.0, 1.0) } else { 0.0 };
+                    i.pan = if pan.is_finite() { pan.clamp(-1.0, 1.0) } else { 0.0 };
+                    i.mute = mute;
+                }
+            }
+            Cmd::Fx { ins, slot, fx } => {
+                let (i, s) = (ins as usize, slot as usize);
+                if i < MAX_INS && s < FX_SLOTS {
+                    if let Some(old) = std::mem::replace(&mut self.inserts[i].fx[s], fx) {
+                        self.discard(Garbage::Fx(old));
+                    }
+                } else if let Some(fx) = fx {
+                    self.discard(Garbage::Fx(fx));
+                }
+            }
+            Cmd::FxParam { ins, slot, param, value } => {
+                if let Some(Some(fx)) = self.inserts.get_mut(ins as usize).and_then(|i| i.fx.get_mut(slot as usize)) {
+                    fx.set(param as usize, value);
+                }
+            }
+            Cmd::FxBypass { ins, slot, bypass } => {
+                if let Some(Some(fx)) = self.inserts.get_mut(ins as usize).and_then(|i| i.fx.get_mut(slot as usize)) {
+                    fx.bypass = bypass;
+                }
+            }
         }
     }
 
@@ -297,8 +410,8 @@ impl Engine {
         }
     }
 
-    fn pattern_ticks(&self) -> f64 {
-        self.pat_len[self.pattern] as f64 * TICKS_PER_STEP
+    fn pattern_ticks(&self, pat: usize) -> f64 {
+        self.pat_len[pat] as f64 * TICKS_PER_STEP
     }
 
     fn push_ev(&mut self, ev: Ev) {
@@ -324,6 +437,76 @@ impl Engine {
         self.publish();
     }
 
+    /// Events of one clip in song ticks [t0, t1) (offs also at t1 when
+    /// `close` = the range ends at the loop end). `base` = ticks from the
+    /// block start to t0.
+    #[allow(clippy::too_many_arguments)]
+    fn schedule_clip(&mut self, clip: Clip, t0: f64, t1: f64, close: bool, base: f64, tpf: f64, n: usize) {
+        let p = clip.pattern as usize;
+        if p >= MAX_PAT || clip.len == 0 {
+            return;
+        }
+        let (cs, ce) = (clip.start as f64, (clip.start + clip.len) as f64);
+        if cs >= t1 || ce < t0 {
+            return;
+        }
+        let plen = self.pattern_ticks(p);
+        let frame_of = |t: f64| (((t - t0 + base) / tpf) as usize).min(n - 1) as u16;
+        for ch in 0..MAX_CH {
+            if !self.channels[ch].used || self.channels[ch].inst.is_none() {
+                continue;
+            }
+            let mute = self.channels[ch].mute;
+            for i in 0..self.notes[p][ch].len() {
+                let nt = self.notes[p][ch][i];
+                let u0 = nt.pos as f64;
+                if u0 >= plen || nt.vel == 0 {
+                    continue;
+                }
+                let u = u0 + laws::swing_offset(u0, self.swing, TICKS_PER_STEP);
+                let len = if nt.len > 0 { nt.len as f64 } else { TICKS_PER_STEP };
+                // pattern repeats k = 0.. inside the clip
+                let k0 = (((t0 - cs - u - len) / plen).floor()).max(0.0) as i64;
+                let k1 = ((t1 - cs - u) / plen).floor() as i64;
+                for k in k0..=k1 {
+                    let on = cs + k as f64 * plen + u;
+                    if on >= ce {
+                        break;
+                    }
+                    let off = (on + len).min(ce);
+                    if off >= t0 && (off < t1 || (close && off <= t1)) {
+                        self.push_ev(Ev { frame: frame_of(off), ch: ch as u8, on: false, key: nt.key, vel: 0 });
+                    }
+                    if on >= t0 && on < t1 && !mute {
+                        self.push_ev(Ev { frame: frame_of(on), ch: ch as u8, on: true, key: nt.key, vel: nt.vel });
+                    }
+                }
+            }
+        }
+    }
+
+    fn schedule_range(&mut self, t0: f64, t1: f64, close: bool, base: f64, tpf: f64, n: usize) {
+        if self.metronome {
+            let mut beat = (t0 / PPQ).ceil() * PPQ;
+            while beat < t1 {
+                let frame = (((beat - t0 + base) / tpf) as usize).min(n - 1) as u16;
+                let bar = (beat / PPQ) as i64 % 4 == 0;
+                self.push_ev(Ev { frame, ch: METRO_CH, on: true, key: bar as u8, vel: 100 });
+                beat += PPQ;
+            }
+        }
+        if self.song_mode {
+            for i in 0..self.clips.len() {
+                let c = self.clips[i];
+                self.schedule_clip(c, t0, t1, close, base, tpf, n);
+            }
+        } else {
+            let len = self.pattern_ticks(self.pattern) as u32;
+            let clip = Clip { start: 0, len, pattern: self.pattern as u8 };
+            self.schedule_clip(clip, t0, t1, close, base, tpf, n);
+        }
+    }
+
     /// This block's note on / off events, sorted by frame (offs first).
     fn schedule(&mut self, n: usize) {
         self.n_events = 0;
@@ -332,46 +515,27 @@ impl Engine {
         }
         let tpf = self.tempo * PPQ / 60.0 / self.sr;
         let span = n as f64 * tpf;
-        let len_ticks = self.pattern_ticks();
-        let frame_of = |d: f64| ((d / tpf) as usize).min(n - 1) as u16;
-
-        if self.metronome {
-            let mut beat = 0.0;
-            while beat < len_ticks {
-                let d = (beat - self.pos).rem_euclid(len_ticks);
-                if d < span {
-                    let key = if beat == 0.0 { 1 } else { 0 };
-                    self.push_ev(Ev { frame: frame_of(d), ch: METRO_CH, on: true, key, vel: 100 });
-                }
-                beat += PPQ;
+        let end = self.loop_len();
+        if self.pos >= end {
+            self.pos %= end;
+        }
+        // the block may wrap the loop several times (short pattern, fast tempo)
+        let (mut t0, mut left, mut base) = (self.pos, span, 0.0);
+        for _ in 0..64 {
+            let t1 = (t0 + left).min(end);
+            let close = t0 + left >= end;
+            self.schedule_range(t0, t1, close, base, tpf, n);
+            if !close {
+                break;
+            }
+            base += end - t0;
+            left -= end - t0;
+            t0 = 0.0;
+            if left <= 1e-9 {
+                break;
             }
         }
-
-        for ch in 0..MAX_CH {
-            if !self.channels[ch].used || self.channels[ch].inst.is_none() {
-                continue;
-            }
-            let mute = self.channels[ch].mute;
-            let count = self.notes[self.pattern][ch].len();
-            for i in 0..count {
-                let nt = self.notes[self.pattern][ch][i];
-                let t0 = nt.pos as f64;
-                if t0 >= len_ticks || nt.vel == 0 {
-                    continue;
-                }
-                let on = t0 + laws::swing_offset(t0, self.swing, TICKS_PER_STEP);
-                let len = if nt.len > 0 { nt.len as f64 } else { TICKS_PER_STEP };
-                let off = on + len.min(len_ticks - 1.0);
-                let d_off = (off - self.pos).rem_euclid(len_ticks);
-                if d_off < span {
-                    self.push_ev(Ev { frame: frame_of(d_off), ch: ch as u8, on: false, key: nt.key, vel: 0 });
-                }
-                let d_on = (on - self.pos).rem_euclid(len_ticks);
-                if d_on < span && !mute {
-                    self.push_ev(Ev { frame: frame_of(d_on), ch: ch as u8, on: true, key: nt.key, vel: nt.vel });
-                }
-            }
-        }
+        let pos = self.pos;
         // insertion sort: by frame, note offs before note ons
         let ev = &mut self.events[..self.n_events];
         for i in 1..ev.len() {
@@ -381,7 +545,7 @@ impl Engine {
                 j -= 1;
             }
         }
-        self.pos = (self.pos + span) % len_ticks;
+        self.pos = (pos + span) % end;
     }
 
     fn apply(&mut self, e: Ev) {
@@ -404,6 +568,7 @@ impl Engine {
         }
     }
 
+    /// Channels -> their mixer inserts, for frames [a, b).
     fn render_range(&mut self, a: usize, b: usize) {
         if a >= b {
             return;
@@ -430,16 +595,17 @@ impl Engine {
                 laws::pan_gains(c.pan)
             };
             let (gl, gr) = ((g * pl) as f32, (g * pr) as f32);
+            let ins = &mut self.inserts[c.insert];
             let mut peak = self.peaks[ch];
             for i in 0..n {
                 let (l, r) = (tl[i] * gl, tr[i] * gr);
-                self.buf_l[a + i] += l;
-                self.buf_r[a + i] += r;
+                ins.l[a + i] += l;
+                ins.r[a + i] += r;
                 peak = peak.max(l.abs()).max(r.abs());
             }
             self.peaks[ch] = peak;
         }
-        // metronome straight to the master
+        // metronome
         let (tl, tr) = (&mut self.ch_l[..n], &mut self.ch_r[..n]);
         tl.fill(0.0);
         tr.fill(0.0);
@@ -454,6 +620,10 @@ impl Engine {
         self.schedule(n);
         self.buf_l[..n].fill(0.0);
         self.buf_r[..n].fill(0.0);
+        for ins in self.inserts.iter_mut() {
+            ins.l[..n].fill(0.0);
+            ins.r[..n].fill(0.0);
+        }
         let mut cur = 0;
         for i in 0..self.n_events {
             let e = self.events[i];
@@ -466,16 +636,42 @@ impl Engine {
         }
         self.render_range(cur, n);
 
-        let mg = laws::fader_to_gain(self.master) as f32;
-        let mut mp = self.peaks[MAX_CH];
+        // inserts 1.. -> master (insert 0)
+        let (sr, tempo) = (self.sr as f32, self.tempo as f32);
+        let (head, rest) = self.inserts.split_at_mut(1);
+        let master = &mut head[0];
+        for ins in rest.iter_mut() {
+            Self::run_insert(ins, n, sr, tempo);
+            for i in 0..n {
+                master.l[i] += ins.l[i];
+                master.r[i] += ins.r[i];
+            }
+        }
+        Self::run_insert(master, n, sr, tempo);
         for i in 0..n {
-            let l = (self.buf_l[i] * mg).clamp(-1.0, 1.0);
-            let r = (self.buf_r[i] * mg).clamp(-1.0, 1.0);
+            let l = (self.buf_l[i] + master.l[i]).clamp(-1.0, 1.0);
+            let r = (self.buf_r[i] + master.r[i]).clamp(-1.0, 1.0);
             self.buf_l[i] = l;
             self.buf_r[i] = r;
-            mp = mp.max(l.abs()).max(r.abs());
+            self.peaks[MAX_CH] = self.peaks[MAX_CH].max(l.abs()).max(r.abs());
         }
-        self.peaks[MAX_CH] = mp;
+    }
+
+    /// FX slots, then fader (FL law, 0.8 = 0 dB) and balance pan, in place.
+    fn run_insert(ins: &mut Insert, n: usize, sr: f32, tempo: f32) {
+        let (l, r) = (&mut ins.l[..n], &mut ins.r[..n]);
+        for fx in ins.fx.iter_mut().flatten() {
+            fx.process(l, r, sr, tempo);
+        }
+        let g = if ins.mute { 0.0 } else { laws::fader_to_gain(ins.vol as f64) as f32 };
+        let (gl, gr) = (g * (1.0 - ins.pan).min(1.0), g * (1.0 + ins.pan).min(1.0));
+        let mut peak = ins.peak;
+        for i in 0..n {
+            l[i] *= gl;
+            r[i] *= gr;
+            peak = peak.max(l[i].abs()).max(r[i].abs());
+        }
+        ins.peak = peak;
     }
 
     fn publish(&mut self) {
@@ -486,12 +682,17 @@ impl Engine {
             st.peaks[i].fetch_max(p.to_bits(), Ordering::Relaxed);
             *p = 0.0;
         }
+        for (i, ins) in self.inserts.iter_mut().enumerate() {
+            st.ins_peaks[i].fetch_max(ins.peak.to_bits(), Ordering::Relaxed);
+            ins.peak = 0.0;
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fx::FxKind;
     use crate::threeosc::OscParams;
 
     fn engine(sr: f64) -> Engine {
@@ -533,12 +734,16 @@ mod tests {
 
     fn channel(e: &mut Engine, ch: u8, inst: Instrument, vol: f32, mute: bool) {
         e.handle(Cmd::Instrument { ch, inst: Box::new(inst) });
-        e.handle(Cmd::Channel { ch, vol, pan: 0.0, pitch: 0.0, mute, used: true });
+        e.handle(Cmd::Channel { ch, vol, pan: 0.0, pitch: 0.0, mute, used: true, insert: 0 });
     }
 
-    fn steps(e: &mut Engine, ch: u8, steps: &[u32]) {
+    fn steps_in(e: &mut Engine, pat: u8, ch: u8, steps: &[u32]) {
         let notes: Vec<Note> = steps.iter().map(|s| Note { pos: s * 24, len: 0, key: 60, vel: 100 }).collect();
-        e.handle(Cmd::Notes { pat: 0, ch, notes: notes.into_boxed_slice() });
+        e.handle(Cmd::Notes { pat, ch, notes: notes.into_boxed_slice() });
+    }
+
+    fn steps(e: &mut Engine, ch: u8, s: &[u32]) {
+        steps_in(e, 0, ch, s);
     }
 
     #[test]
@@ -605,13 +810,46 @@ mod tests {
         let mut e = engine(48000.0);
         channel(&mut e, 0, Instrument::osc(OscParams::default(), 48000.0), 1.0, false);
         e.handle(Cmd::Tempo(120.0));
-        e.handle(Cmd::PatternLen { pat: 0, steps: 16 });
         let notes = vec![Note { pos: 0, len: 96, key: 60, vel: 100 }].into_boxed_slice();
         e.handle(Cmd::Notes { pat: 0, ch: 0, notes });
         e.handle(Cmd::Play(true));
         let out = render(&mut e, 40000);
         let last = out.chunks(2).rposition(|f| f[0] != 0.0).unwrap();
         assert!((last as i64 - (24000 + 440)).abs() <= 2, "{last}");
+    }
+
+    #[test]
+    fn note_spanning_the_whole_pattern_is_released_at_the_loop() {
+        // a 16-step note in a 16-step pattern: off at the loop end, on again at 0 (no hang, no double)
+        let mut e = engine(48000.0);
+        channel(&mut e, 0, Instrument::osc(OscParams::default(), 48000.0), 1.0, false);
+        e.handle(Cmd::Tempo(120.0)); // pattern = 2 s = 96000 frames
+        let notes = vec![Note { pos: 0, len: 384, key: 60, vel: 100 }].into_boxed_slice();
+        e.handle(Cmd::Notes { pat: 0, ch: 0, notes });
+        e.handle(Cmd::Play(true));
+        render(&mut e, 96000 + 1000);
+        assert_eq!(e.channels[0].held[0] & (1 << 60), 1 << 60, "retriggered after the loop");
+        e.handle(Cmd::Play(false));
+        assert_eq!(e.channels[0].held, [0; 2]);
+    }
+
+    #[test]
+    fn one_step_pattern_at_fast_tempo_fires_every_step() {
+        // 1-step pattern (24 ticks) at 300 BPM / 44.1 kHz; every loop retriggers
+        let mut e = engine(44100.0);
+        channel(&mut e, 0, Instrument::osc(OscParams::default(), 44100.0), 1.0, false);
+        e.handle(Cmd::Tempo(300.0));
+        e.handle(Cmd::PatternLen { pat: 0, steps: 1 });
+        steps(&mut e, 0, &[0]);
+        e.handle(Cmd::Play(true));
+        let mut ons = 0;
+        let mut out = vec![0f32; 128];
+        for _ in 0..100 {
+            e.process(&mut out);
+            ons += e.events[..e.n_events].iter().filter(|ev| ev.on).count();
+        }
+        // 6400 frames = 6400 * 300 * 96 / 60 / 44100 = 69.66 ticks -> ons at 0, 24, 48
+        assert_eq!(ons, 3);
     }
 
     #[test]
@@ -628,6 +866,50 @@ mod tests {
     }
 
     #[test]
+    fn song_mode_plays_clips_in_order() {
+        // pattern 0: kick on step 0; pattern 1: hat on step 0. 120 BPM, 48 kHz: bar = 96000 frames.
+        let mut e = engine(48000.0);
+        channel(&mut e, 0, Instrument::Sampler(Sampler::new(0)), 1.0, false);
+        channel(&mut e, 1, Instrument::Sampler(Sampler::new(2)), 1.0, false);
+        e.handle(Cmd::Tempo(120.0));
+        steps_in(&mut e, 0, 0, &[0]);
+        steps_in(&mut e, 1, 1, &[0]);
+        let clips = vec![
+            Clip { start: 0, len: 384, pattern: 0 },
+            Clip { start: 384, len: 768, pattern: 1 }, // 2 bars: pattern 1 repeats
+        ];
+        e.handle(Cmd::Clips(clips.into_boxed_slice()));
+        e.handle(Cmd::SongMode(true));
+        e.handle(Cmd::Play(true));
+        let out = render(&mut e, 96000 * 3 + 4000);
+        // bar 1 kick, bars 2 and 3 hat, then the song loops to the kick
+        assert_near(&onsets(&out), &[0, 96000, 192000, 288000]);
+        let peak = |f: usize| out[f * 2..(f + 3000) * 2].iter().fold(0f32, |m, x| m.max(x.abs()));
+        assert!(peak(0) > 0.3 && peak(288000) > 0.3, "kick");
+        assert!(peak(96000) < peak(0), "hat is quieter than the kick");
+    }
+
+    #[test]
+    fn insert_fx_and_fader_apply() {
+        let mut e = engine(48000.0);
+        e.handle(Cmd::Instrument { ch: 0, inst: Box::new(Instrument::Sampler(Sampler::new(0))) });
+        e.handle(Cmd::Channel { ch: 0, vol: 1.0, pan: 0.0, pitch: 0.0, mute: false, used: true, insert: 3 });
+        e.handle(Cmd::NoteOn { ch: 0, key: 60, vel: 100 });
+        let dry = render(&mut e, 48000);
+        // muted insert: silence
+        e.handle(Cmd::Insert { idx: 3, vol: 0.8, pan: 0.0, mute: true });
+        e.handle(Cmd::NoteOn { ch: 0, key: 60, vel: 100 });
+        assert!(render(&mut e, 48000).iter().all(|x| *x == 0.0));
+        // reverb on the insert: a tail after the kick (0.55 s) ends
+        e.handle(Cmd::Insert { idx: 3, vol: 0.8, pan: 0.0, mute: false });
+        e.handle(Cmd::Fx { ins: 3, slot: 0, fx: Some(Box::new(Effect::new(FxKind::Reverb, 48000.0))) });
+        e.handle(Cmd::NoteOn { ch: 0, key: 60, vel: 100 });
+        let wet = render(&mut e, 48000);
+        let tail = |o: &[f32]| o[2 * 30000..2 * 40000].iter().map(|x| x.abs()).sum::<f32>();
+        assert!(tail(&dry) < 1e-3 && tail(&wet) > 1.0, "{} {}", tail(&dry), tail(&wet));
+    }
+
+    #[test]
     fn voice_pool_survives_overload() {
         let mut e = engine(48000.0);
         for ch in 0..MAX_CH as u8 {
@@ -640,6 +922,9 @@ mod tests {
             let notes: Vec<Note> =
                 (0..64).map(|s| Note { pos: s * 24, len: 48, key: 40 + (s % 40) as u8, vel: 128 }).collect();
             e.handle(Cmd::Notes { pat: 0, ch, notes: notes.into_boxed_slice() });
+        }
+        for i in 1..MAX_INS as u8 {
+            e.handle(Cmd::Fx { ins: i, slot: 0, fx: Some(Box::new(Effect::new(FxKind::Distortion, 48000.0))) });
         }
         e.handle(Cmd::PatternLen { pat: 0, steps: 64 });
         e.handle(Cmd::Tempo(522.0));

@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:orchard_engine/orchard_engine.dart';
 
 import '../project.dart';
 import 'engine_clock.dart';
@@ -395,6 +396,23 @@ Future<void> _channelMenu(BuildContext context, Project p, EngineClock clock, in
               },
               onChangeEnd: (_) => p.preview(index),
             ),
+            Row(children: [
+              const Text('Дорожка микшера', style: TextStyle(color: C.textDim)),
+              const SizedBox(width: 12),
+              DropdownButton<int>(
+                key: const ValueKey('menuInsert'),
+                value: ch.insert,
+                items: [
+                  for (var i = 0; i < kMixerInserts; i++)
+                    DropdownMenuItem(value: i, child: Text(i == 0 ? 'Master' : 'Insert $i')),
+                ],
+                onChanged: (v) {
+                  if (v == null) return;
+                  p.updateChannel(index, (c) => c.insert = v);
+                  setState(() {});
+                },
+              ),
+            ]),
             const SizedBox(height: 8),
             Row(children: [
               TextButton.icon(

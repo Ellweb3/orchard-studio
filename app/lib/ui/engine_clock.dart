@@ -21,6 +21,9 @@ class EngineClock {
   final List<ValueNotifier<double>> levels = List.generate(kMaxChannels + 1, (_) => ValueNotifier(0));
   ValueNotifier<double> get masterLevel => levels[kMaxChannels];
 
+  /// Mixer insert levels after their faders (0 = master).
+  final List<ValueNotifier<double>> insertLevels = List.generate(kMixerInserts, (_) => ValueNotifier(0));
+
   bool playing = false;
 
   void _tick(Duration _) {
@@ -32,6 +35,12 @@ class EngineClock {
       final p = engine.takePeak(i);
       final l = levels[i];
       // fast attack, ~300 ms release
+      l.value = p > l.value ? p : l.value * 0.88;
+      if (l.value < 1e-4) l.value = 0;
+    }
+    for (var i = 0; i < kMixerInserts; i++) {
+      final p = engine.takeInsertPeak(i);
+      final l = insertLevels[i];
       l.value = p > l.value ? p : l.value * 0.88;
       if (l.value < 1e-4) l.value = 0;
     }

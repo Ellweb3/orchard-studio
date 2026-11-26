@@ -24,9 +24,16 @@ void main() {
       e.setChannel(2, vol: 0.78, pan: 0);
       e.setNotes(0, 2, const [EngineNote(0, 96, 60, 100)]);
     }
+    e.setInsert(1, vol: 0.8, pan: 0);
+    e.setFx(1, 0, 0); // reverb
+    e.setFxParam(1, 0, 2, 0.5);
+    e.setClips(const [EngineClip(0, kTicksPerBar, 0)]);
     e.setTempo(130);
     e.play(true);
     await Future<void>.delayed(const Duration(milliseconds: 400));
+    expect(e.position, greaterThan(0));
+    e.setSongMode(true);
+    await Future<void>.delayed(const Duration(milliseconds: 200));
     expect(e.position, greaterThan(0));
     // peaks are measured before the master fader
     expect(e.takePeak(0) + e.takePeak(1), greaterThan(0));

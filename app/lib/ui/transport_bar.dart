@@ -27,6 +27,22 @@ class TransportBar extends StatelessWidget {
         ),
         const SizedBox(width: 8),
         BarButton(key: const ValueKey('stop'), icon: Icons.stop, onTap: p.stop),
+        const SizedBox(width: 10),
+        // FL's PAT / SONG switch
+        GestureDetector(
+          key: const ValueKey('patSong'),
+          onTap: () => p.setSongMode(!p.songMode),
+          child: Container(
+            width: 64,
+            height: 52,
+            decoration: BoxDecoration(color: C.panelHi, borderRadius: BorderRadius.circular(10)),
+            child: Column(mainAxisAlignment: MainAxisAlignment.center, children: [
+              _ModeLed('PAT', !p.songMode),
+              const SizedBox(height: 4),
+              _ModeLed('SONG', p.songMode),
+            ]),
+          ),
+        ),
         const SizedBox(width: 16),
         _Tempo(project: p),
         const SizedBox(width: 16),
@@ -53,6 +69,25 @@ class TransportBar extends StatelessWidget {
       ]),
     );
   }
+}
+
+class _ModeLed extends StatelessWidget {
+  const _ModeLed(this.label, this.on);
+  final String label;
+  final bool on;
+
+  @override
+  Widget build(BuildContext context) => Container(
+        width: 52,
+        padding: const EdgeInsets.symmetric(vertical: 2),
+        decoration: BoxDecoration(
+          color: on ? (label == 'PAT' ? C.green : C.accent) : C.bar,
+          borderRadius: BorderRadius.circular(4),
+        ),
+        alignment: Alignment.center,
+        child: Text(label,
+            style: TextStyle(fontSize: 11, fontWeight: FontWeight.w800, color: on ? Colors.black : C.textDim)),
+      );
 }
 
 class _Tempo extends StatefulWidget {

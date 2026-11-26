@@ -77,8 +77,40 @@ external bool oeSetMetronome(Pointer<OeHandle> h, bool on);
 @Native<Bool Function(Pointer<OeHandle>, Uint8, Uint8, Pointer<OeNote>, Uint32)>(symbol: 'oe_set_notes')
 external bool oeSetNotes(Pointer<OeHandle> h, int pat, int ch, Pointer<OeNote> notes, int count);
 
-@Native<Bool Function(Pointer<OeHandle>, Uint8, Float, Float, Float, Bool, Bool)>(symbol: 'oe_set_channel')
-external bool oeSetChannel(Pointer<OeHandle> h, int ch, double vol, double pan, double pitch, bool mute, bool used);
+@Native<Bool Function(Pointer<OeHandle>, Uint8, Float, Float, Float, Bool, Bool, Uint8)>(symbol: 'oe_set_channel')
+external bool oeSetChannel(
+    Pointer<OeHandle> h, int ch, double vol, double pan, double pitch, bool mute, bool used, int insert);
+
+/// engine::Clip (repr C: u32, u32, u8 + 3 padding).
+final class OeClip extends Struct {
+  @Uint32()
+  external int start;
+  @Uint32()
+  external int len;
+  @Uint8()
+  external int pattern;
+}
+
+@Native<Bool Function(Pointer<OeHandle>, Bool)>(symbol: 'oe_song_mode')
+external bool oeSongMode(Pointer<OeHandle> h, bool on);
+
+@Native<Bool Function(Pointer<OeHandle>, Pointer<OeClip>, Uint32)>(symbol: 'oe_set_clips')
+external bool oeSetClips(Pointer<OeHandle> h, Pointer<OeClip> clips, int count);
+
+@Native<Bool Function(Pointer<OeHandle>, Uint8, Float, Float, Bool)>(symbol: 'oe_set_insert')
+external bool oeSetInsert(Pointer<OeHandle> h, int idx, double vol, double pan, bool mute);
+
+@Native<Bool Function(Pointer<OeHandle>, Uint8, Uint8, Uint8, Pointer<Float>)>(symbol: 'oe_set_fx')
+external bool oeSetFx(Pointer<OeHandle> h, int ins, int slot, int kind, Pointer<Float> params);
+
+@Native<Bool Function(Pointer<OeHandle>, Uint8, Uint8, Uint8, Float)>(symbol: 'oe_fx_param')
+external bool oeFxParam(Pointer<OeHandle> h, int ins, int slot, int param, double value);
+
+@Native<Bool Function(Pointer<OeHandle>, Uint8, Uint8, Bool)>(symbol: 'oe_fx_bypass')
+external bool oeFxBypass(Pointer<OeHandle> h, int ins, int slot, bool bypass);
+
+@Native<Float Function(Pointer<OeHandle>, Uint32)>(symbol: 'oe_take_insert_peak', isLeaf: true)
+external double oeTakeInsertPeak(Pointer<OeHandle> h, int idx);
 
 @Native<Bool Function(Pointer<OeHandle>, Uint8, Uint8)>(symbol: 'oe_set_sampler')
 external bool oeSetSampler(Pointer<OeHandle> h, int ch, int sample);

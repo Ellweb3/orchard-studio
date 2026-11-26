@@ -21,7 +21,7 @@ fn piano_plays_and_stops() {
     let mut e = Engine::new(48000.0, Arc::new(Status::new()), None);
     let inst = SoundFontInst::new(&sf, 48000.0, 0, 0).unwrap();
     e.handle(Cmd::Instrument { ch: 0, inst: Box::new(Instrument::SoundFont(inst)) });
-    e.handle(Cmd::Channel { ch: 0, vol: 0.78, pan: 0.0, pitch: 0.0, mute: false, used: true });
+    e.handle(Cmd::Channel { ch: 0, vol: 0.78, pan: 0.0, pitch: 0.0, mute: false, used: true, insert: 1 });
     e.handle(Cmd::Tempo(120.0));
     let notes = vec![Note { pos: 0, len: 48, key: 60, vel: 100 }].into_boxed_slice(); // half a beat
     e.handle(Cmd::Notes { pat: 0, ch: 0, notes });
@@ -37,4 +37,26 @@ fn piano_plays_and_stops() {
     assert!(after < held * 0.05, "after release {after} vs {held}");
     // drum kit bank 128 exists
     assert!(sf.get_presets().iter().any(|p| p.get_bank_number() == 128));
+}
+
+#[test]
+fn pitch_change_while_held_does_not_hang() {
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../app/assets/GeneralUser-GS.sf2");
+    let Ok(bytes) = std::fs::read(path) else { return };
+    let sf = Arc::new(SoundFont::new(&mut std::io::Cursor::new(bytes)).unwrap());
+    let mut e = Engine::new(48000.0, Arc::new(Status::new()), None);
+    let inst = SoundFontInst::new(&sf, 48000.0, 0, 19).unwrap(); // organ: sustains forever
+    e.handle(Cmd::Instrument { ch: 0, inst: Box::new(Instrument::SoundFont(inst)) });
+    e.handle(Cmd::Channel { ch: 0, vol: 1.0, pan: 0.0, pitch: 0.0, mute: false, used: true, insert: 0 });
+    e.handle(Cmd::NoteOn { ch: 0, key: 60, vel: 100 });
+    let mut out = vec![0f32; 2 * 4800];
+    e.process(&mut out);
+    e.handle(Cmd::Channel { ch: 0, vol: 1.0, pan: 0.0, pitch: 3.0, mute: false, used: true, insert: 0 });
+    e.handle(Cmd::NoteOff { ch: 0, key: 60 });
+    let mut out = vec![0f32; 2 * 96000];
+    for c in out.chunks_mut(512) {
+        e.process(c);
+    }
+    let tail = out[2 * 90000..].iter().fold(0f32, |m, x| m.max(x.abs()));
+    assert!(tail < 1e-3, "organ still sounding: {tail}");
 }
