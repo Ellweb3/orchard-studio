@@ -1,0 +1,16 @@
+name: orchard_engine
+description: Rust audio engine for Orchard Studio (Flutter), built via Dart build hooks.
+version: 0.1.0
+publish_to: none
+
+environment:
+  sdk: ^3.10.0
+
+dependencies:
+  code_assets: ^2.2.0
+  ffi: ^2.1.0
+  hooks: ^2.1.0
+  native_toolchain_rust: ^1.1.1
+
+dev_dependencies:
+  test: ^1.25.0
