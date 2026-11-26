@@ -22,7 +22,7 @@ class OrchardApp extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) => MaterialApp(
-        title: 'Orchard',
+        title: 'Emil Beats',
         debugShowCheckedModeBanner: false,
         theme: buildTheme(),
         home: const StudioPage(),
