@@ -372,6 +372,42 @@ class Project extends ChangeNotifier {
     _changed();
   }
 
+  // ---------------------------------------------------------------- helper API
+  /// First pattern with no notes on any channel, or null.
+  int? firstEmptyPattern() {
+    for (var pat = 0; pat < kMaxPatterns; pat++) {
+      if (notes[pat].every((ch) => ch.isEmpty)) return pat;
+    }
+    return null;
+  }
+
+  void setPatternLengthOf(int pat, int steps) {
+    patternLength[pat] = steps.clamp(1, kMaxSteps);
+    engine.setPatternLength(pat, patternLength[pat]);
+    _changed();
+  }
+
+  void replaceNotes(int pat, int ch, List<NoteData> list) {
+    notes[pat][ch]
+      ..clear()
+      ..addAll(list);
+    _pushNotes(pat, ch);
+    _changed();
+  }
+
+  /// Index of the first channel whose instrument matches [test]; adds one with
+  /// [spec] if none does. -1 when the rack is full.
+  int ensureChannel(bool Function(InstrumentSpec) test, InstrumentSpec spec) {
+    final i = channels.indexWhere((c) => test(c.inst));
+    if (i >= 0) return i;
+    if (!canAddChannel) return -1;
+    addChannel(spec);
+    return channels.length - 1;
+  }
+
+  int ensureSamplerChannel(int sample) =>
+      ensureChannel((c) => c.kind == InstKind.sampler && c.sample == sample, InstrumentSpec.sampler(sample));
+
   // ---------------------------------------------------------------- channels
   bool get canAddChannel => channels.length < kMaxChannels;
 

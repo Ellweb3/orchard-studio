@@ -4,13 +4,16 @@ import 'package:orchard_engine/orchard_engine.dart';
 import '../project.dart';
 import 'engine_clock.dart';
 import 'export_dialog.dart';
+import 'helper_sheet.dart';
+import '../ai_helper.dart';
 import 'theme.dart';
 import 'widgets.dart';
 
 class TransportBar extends StatelessWidget {
-  const TransportBar({super.key, required this.project, required this.clock});
+  const TransportBar({super.key, required this.project, required this.clock, required this.helper});
   final Project project;
   final EngineClock clock;
+  final AiHelper helper;
 
   @override
   Widget build(BuildContext context) {
@@ -60,6 +63,13 @@ class TransportBar extends StatelessWidget {
           icon: Icons.timer_outlined,
           active: p.metronome,
           onTap: p.toggleMetronome,
+        ),
+        const SizedBox(width: 8),
+        BarButton(
+          key: const ValueKey('helper'),
+          icon: Icons.auto_awesome,
+          color: C.accent,
+          onTap: () => showHelperSheet(context, p, helper),
         ),
         const SizedBox(width: 8),
         BarButton(

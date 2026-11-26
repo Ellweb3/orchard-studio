@@ -9,6 +9,8 @@ environment:
 dependencies:
   flutter:
     sdk: flutter
+  magenta_music:
+    path: ../packages/magenta_music
   orchard_engine:
     path: ../engine
   path_provider: ^2.1.6

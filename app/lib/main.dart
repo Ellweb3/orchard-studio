@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:orchard_engine/orchard_engine.dart';
 
+import 'ai_helper.dart';
 import 'project.dart';
 import 'ui/channel_rack.dart';
 import 'ui/mixer.dart';
@@ -39,6 +40,7 @@ class _StudioPageState extends State<StudioPage> with WidgetsBindingObserver {
   OrchardEngine? _engine;
   Project? _project;
   EngineClock? _clock;
+  AiHelper? _helper;
   String? _error;
   int _view = 0; // 0 rack, 1 playlist, 2 mixer
 
@@ -54,6 +56,7 @@ class _StudioPageState extends State<StudioPage> with WidgetsBindingObserver {
       _engine = e;
       _project = p;
       _clock = clock;
+      _helper = AiHelper(p);
       p.restore();
       _loadSoundFont(e, p);
     } on EngineException catch (e) {
@@ -84,6 +87,7 @@ class _StudioPageState extends State<StudioPage> with WidgetsBindingObserver {
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     _clock?.dispose();
+    _helper?.dispose();
     _project?.dispose();
     _engine?.dispose();
     super.dispose();
@@ -109,7 +113,7 @@ class _StudioPageState extends State<StudioPage> with WidgetsBindingObserver {
           child: ListenableBuilder(
             listenable: p,
             builder: (context, _) => Column(children: [
-              TransportBar(project: p, clock: _clock!),
+              TransportBar(project: p, clock: _clock!, helper: _helper!),
               Container(
                 color: C.bar,
                 padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),

@@ -1,0 +1,19 @@
+[package]
+name = "magenta-music"
+version = "0.1.0"
+edition = "2024"
+description = "Magenta MusicRNN / MusicVAE inference in pure Rust (TensorFlow.js checkpoints), with a C ABI for Dart"
+license = "Apache-2.0"
+publish = false
+
+[lib]
+name = "magenta_music"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[dependencies]
+serde_json = "1"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
