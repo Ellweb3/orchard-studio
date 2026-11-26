@@ -5,6 +5,8 @@ library;
 
 import 'dart:ffi';
 
+import 'package:ffi/ffi.dart';
+
 final class OeHandle extends Opaque {}
 
 final class OeSoundFont extends Opaque {}
@@ -158,3 +160,11 @@ external int oeSampleRate(Pointer<OeHandle> h);
 
 @Native<Uint64 Function(Pointer<OeHandle>)>(symbol: 'oe_xruns', isLeaf: true)
 external int oeXruns(Pointer<OeHandle> h);
+
+@Native<Pointer<OeHandle> Function(Pointer<OeHandle>, Uint32)>(symbol: 'oe_offline_create')
+external Pointer<OeHandle> oeOfflineCreate(Pointer<OeHandle> live, int sampleRate);
+
+@Native<Bool Function(Pointer<OeHandle>, Uint64, Uint64, Pointer<Utf8>, Uint8, Uint32, Pointer<Uint32>)>(
+    symbol: 'oe_export')
+external bool oeExport(Pointer<OeHandle> h, int playFrames, int tailFrames, Pointer<Utf8> path, int format,
+    int kbps, Pointer<Uint32> progress);

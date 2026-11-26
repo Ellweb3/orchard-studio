@@ -72,7 +72,8 @@ class ChannelData {
 class Project extends ChangeNotifier {
   Project(this.engine);
 
-  final OrchardEngine engine;
+  /// The live engine (swapped for an offline one only inside [exportTrack]).
+  OrchardEngine engine;
 
   double tempo = 130;
   double swing = 0;
@@ -553,6 +554,45 @@ class Project extends ChangeNotifier {
       debugPrint('restore failed: $e');
     }
     loadDefault();
+  }
+
+  // ---------------------------------------------------------------- export
+  /// Renders the song (or [repeats] loops of the current pattern) with an
+  /// offline engine to `Documents/Orchard/<name>.<wav or mp3>`. Returns the path.
+  Future<String> exportTrack({
+    required String name,
+    required ExportFormat format,
+    required bool song,
+    int repeats = 1,
+    void Function(double)? onProgress,
+  }) async {
+    final live = engine;
+    final off = live.offline();
+    final (wasMetro, wasSong) = (metronome, songMode);
+    try {
+      // replay the whole project into the offline engine
+      engine = off;
+      metronome = false;
+      songMode = song;
+      syncAll();
+    } finally {
+      engine = live;
+      metronome = wasMetro;
+      songMode = wasSong;
+    }
+    final ticks = song ? songBars * kTicksPerBar : patternTicks * repeats;
+    final frames = (ticks * 60 / (tempo * kPpq) * 44100).round();
+    final dir = Directory('${(await getApplicationDocumentsDirectory()).path}/Orchard');
+    await dir.create(recursive: true);
+    final safe = name.trim().replaceAll(RegExp(r'[\\/:*?"<>|]'), '_');
+    final path = '${dir.path}/${safe.isEmpty ? 'track' : safe}.${format.name}';
+    try {
+      off.play(true);
+      await off.export(path, playFrames: frames, format: format, onProgress: onProgress);
+    } finally {
+      off.dispose();
+    }
+    return path;
   }
 
   @override

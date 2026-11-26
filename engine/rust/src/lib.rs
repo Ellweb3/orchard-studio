@@ -6,6 +6,7 @@
 
 pub mod drumkit;
 pub mod engine;
+pub mod export;
 pub mod fx;
 pub mod instrument;
 pub mod laws;
@@ -26,11 +27,16 @@ use fx::{Effect, FxKind};
 use instrument::{Instrument, Sampler, SoundFontInst};
 use threeosc::OscParams;
 
+enum Backend {
+    /// Real-time: the engine lives in the cpal callback.
+    Live { tx: rtrb::Producer<Cmd>, garbage: rtrb::Consumer<Garbage>, output: output::Output },
+    /// Export: the engine is called directly on the caller's thread.
+    Offline { engine: Box<engine::Engine> },
+}
+
 pub struct OeHandle {
-    tx: rtrb::Producer<Cmd>,
-    garbage: rtrb::Consumer<Garbage>,
+    backend: Backend,
     status: Arc<Status>,
-    output: output::Output,
     sr: f64,
     kit_size: usize,
     sf: Option<Arc<SoundFont>>,
@@ -57,7 +63,7 @@ pub extern "C" fn oe_create() -> *mut OeHandle {
         let (gtx, grx) = rtrb::RingBuffer::<Garbage>::new(8192);
         let (output, sr) = output::Output::start(Arc::clone(&status), rx, gtx)?;
         let kit_size = drumkit::builtin_kit().len();
-        Ok::<_, String>(OeHandle { tx, garbage: grx, status, output, sr, kit_size, sf: None })
+        Ok::<_, String>(OeHandle { backend: Backend::Live { tx, garbage: grx, output }, status, sr, kit_size, sf: None })
     }));
     match r {
         Ok(Ok(h)) => Box::into_raw(Box::new(h)),
@@ -94,18 +100,78 @@ fn handle<'a>(h: *mut OeHandle) -> Option<&'a mut OeHandle> {
 /// Drops whatever the audio thread handed back (old note lists, instruments).
 #[unsafe(no_mangle)]
 pub extern "C" fn oe_collect(h: *mut OeHandle) {
-    if let Some(h) = handle(h) {
-        while h.garbage.pop().is_ok() {}
+    if let Some(OeHandle { backend: Backend::Live { garbage, .. }, .. }) = handle(h) {
+        while garbage.pop().is_ok() {}
     }
 }
 
 fn send(h: *mut OeHandle, cmd: Cmd) -> bool {
-    match handle(h) {
-        Some(h) => {
-            while h.garbage.pop().is_ok() {}
-            h.tx.push(cmd).is_ok()
+    match handle(h).map(|h| &mut h.backend) {
+        Some(Backend::Live { tx, garbage, .. }) => {
+            while garbage.pop().is_ok() {}
+            tx.push(cmd).is_ok()
+        }
+        Some(Backend::Offline { engine }) => {
+            engine.handle(cmd);
+            true
         }
         None => false,
+    }
+}
+
+/// An engine without audio output for exporting, sharing `live`'s SoundFont.
+/// Configure it with the usual `oe_*` setters, start it with `oe_play`, then
+/// call `oe_export`. Free with `oe_destroy`.
+#[unsafe(no_mangle)]
+pub extern "C" fn oe_offline_create(live: *mut OeHandle, sample_rate: u32) -> *mut OeHandle {
+    let sf = handle(live).and_then(|h| h.sf.clone());
+    let sr = if sample_rate == 0 { 44100.0 } else { sample_rate as f64 };
+    let status = Arc::new(Status::new());
+    let engine = Box::new(engine::Engine::new(sr, Arc::clone(&status), None));
+    let kit_size = engine.kit_size();
+    Box::into_raw(Box::new(OeHandle { backend: Backend::Offline { engine }, status, sr, kit_size, sf }))
+}
+
+/// Renders `play_frames` + up to `tail_frames` (stops early on silence) to
+/// `path`. `format`: 0 WAV, 1 MP3 (`kbps`). `progress` (f32 bits, 0..1) may be
+/// null. Blocking: call it from a background isolate.
+///
+/// # Safety
+/// `h` must be an offline handle used by no other thread meanwhile; `path` a
+/// NUL-terminated UTF-8 string; `progress` null or valid for writes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oe_export(
+    h: *mut OeHandle,
+    play_frames: u64,
+    tail_frames: u64,
+    path: *const c_char,
+    format: u8,
+    kbps: u32,
+    progress: *const std::sync::atomic::AtomicU32,
+) -> bool {
+    let Some(OeHandle { backend: Backend::Offline { engine }, .. }) = handle(h) else {
+        set_error("oe_export needs an offline handle".into());
+        return false;
+    };
+    if path.is_null() {
+        return false;
+    }
+    let Ok(path) = (unsafe { std::ffi::CStr::from_ptr(path) }).to_str() else {
+        set_error("path is not UTF-8".into());
+        return false;
+    };
+    let fmt = if format == 1 { export::Format::Mp3 } else { export::Format::Wav };
+    let progress = unsafe { progress.as_ref() };
+    match catch_unwind(AssertUnwindSafe(|| export::render(engine, play_frames, tail_frames, path, fmt, kbps, progress))) {
+        Ok(Ok(())) => true,
+        Ok(Err(e)) => {
+            set_error(e);
+            false
+        }
+        Err(_) => {
+            set_error("panic while exporting".into());
+            false
+        }
     }
 }
 
@@ -375,7 +441,10 @@ pub extern "C" fn oe_sample_rate(h: *mut OeHandle) -> u32 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn oe_xruns(h: *mut OeHandle) -> u64 {
-    handle(h).map_or(0, |h| h.output.xruns.load(Ordering::Relaxed))
+    match handle(h).map(|h| &h.backend) {
+        Some(Backend::Live { output, .. }) => output.xruns.load(Ordering::Relaxed),
+        _ => 0,
+    }
 }
 
 #[unsafe(no_mangle)]

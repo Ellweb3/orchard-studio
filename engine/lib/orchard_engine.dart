@@ -99,6 +99,8 @@ class OscParams {
   }
 }
 
+enum ExportFormat { wav, mp3 }
+
 class SoundFontPreset {
   const SoundFontPreset(this.name, this.bank, this.program);
   final String name;
@@ -122,6 +124,38 @@ class OrchardEngine {
   static String _lastError() {
     final err = b.oeLastError();
     return err == nullptr ? 'unknown error' : err.cast<Utf8>().toDartString();
+  }
+
+  /// An engine without audio output, for [export]. Shares this engine's
+  /// SoundFont. Set it up with the same setters, call [play], then [export].
+  OrchardEngine offline({int sampleRate = 44100}) {
+    final h = b.oeOfflineCreate(_h, sampleRate);
+    return OrchardEngine._(h).._presets = _presets;
+  }
+
+  /// Renders [playFrames] (+ up to [tailFrames] of reverb/release tail) of an
+  /// offline engine to [path] on a background isolate. [onProgress] gets 0..1.
+  Future<void> export(String path,
+      {required int playFrames,
+      int tailFrames = 44100 * 6,
+      ExportFormat format = ExportFormat.mp3,
+      int kbps = 192,
+      void Function(double)? onProgress}) async {
+    final progress = calloc<Uint32>();
+    final timer = onProgress == null
+        ? null
+        : Stream<void>.periodic(const Duration(milliseconds: 100)).listen((_) {
+            onProgress(Float32List.view(Uint32List.fromList([progress.value]).buffer)[0]);
+          });
+    final job = (_h.address, progress.address, playFrames, tailFrames, path, format.index, kbps);
+    try {
+      final err = await _spawnExport(job);
+      if (err != null) throw EngineException(err);
+      onProgress?.call(1);
+    } finally {
+      await timer?.cancel();
+      calloc.free(progress);
+    }
   }
 
   void dispose() {
@@ -294,4 +328,20 @@ class OrchardEngine {
   double takePeak(int ch) => b.oeTakePeak(_h, ch);
   int get sampleRate => b.oeSampleRate(_h);
   int get xruns => b.oeXruns(_h);
+}
+
+/// Own function so the isolate closure's context holds nothing but [job].
+Future<String?> _spawnExport((int, int, int, int, String, int, int) job) => Isolate.run(() => _exportJob(job));
+
+/// Runs on the export isolate: only plain values cross the isolate boundary.
+String? _exportJob((int, int, int, int, String, int, int) job) {
+  final (addr, pAddr, playFrames, tailFrames, path, fmt, kbps) = job;
+  final p = path.toNativeUtf8();
+  try {
+    final ok = b.oeExport(
+        Pointer<b.OeHandle>.fromAddress(addr), playFrames, tailFrames, p, fmt, kbps, Pointer<Uint32>.fromAddress(pAddr));
+    return ok ? null : OrchardEngine._lastError();
+  } finally {
+    malloc.free(p);
+  }
 }

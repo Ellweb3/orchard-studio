@@ -3,6 +3,7 @@ import 'package:orchard_engine/orchard_engine.dart';
 
 import '../project.dart';
 import 'engine_clock.dart';
+import 'export_dialog.dart';
 import 'theme.dart';
 import 'widgets.dart';
 
@@ -59,6 +60,12 @@ class TransportBar extends StatelessWidget {
           icon: Icons.timer_outlined,
           active: p.metronome,
           onTap: p.toggleMetronome,
+        ),
+        const SizedBox(width: 8),
+        BarButton(
+          key: const ValueKey('export'),
+          icon: Icons.ios_share,
+          onTap: () => showExportDialog(context, p),
         ),
         const SizedBox(width: 16),
         Expanded(child: _Patterns(project: p)),

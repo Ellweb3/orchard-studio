@@ -39,6 +39,25 @@ void main() {
     expect(e.takePeak(0) + e.takePeak(1), greaterThan(0));
     e.play(false);
     e.collect();
+
+    // offline export of the same setup
+    final off = e.offline();
+    off.setSampler(0, 0);
+    off.setChannel(0, vol: 0.78, pan: 0, insert: 1);
+    off.setNotes(0, 0, const [EngineNote(0, 0, 60, 100), EngineNote(48, 0, 60, 100)]);
+    off.setTempo(120);
+    off.play(true);
+    final dir = Directory.systemTemp.createTempSync('orchard');
+    for (final f in ExportFormat.values) {
+      final path = '${dir.path}/t.${f.name}';
+      var last = 0.0;
+      await off.export(path, playFrames: 88200, format: f, onProgress: (p) => last = p);
+      expect(File(path).lengthSync(), greaterThan(f == ExportFormat.wav ? 88200 * 4 : 30000));
+      expect(last, 1.0);
+      off.play(true);
+    }
+    dir.deleteSync(recursive: true);
+    off.dispose();
     e.dispose();
   });
 }
