@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SampleFormat, SizedSample, StreamConfig};
 
-use crate::engine::{Cmd, Engine, Status};
+use crate::engine::{Cmd, Engine, Garbage, Status};
 
 pub struct Output {
     _stream: cpal::Stream,
@@ -71,7 +71,12 @@ where
 }
 
 impl Output {
-    pub fn start(status: Arc<Status>, rx: rtrb::Consumer<Cmd>) -> Result<Self, String> {
+    /// Returns the stream and its sample rate.
+    pub fn start(
+        status: Arc<Status>,
+        rx: rtrb::Consumer<Cmd>,
+        garbage: rtrb::Producer<Garbage>,
+    ) -> Result<(Self, f64), String> {
         let host = cpal::default_host();
         let device = host
             .default_output_device()
@@ -81,7 +86,8 @@ impl Output {
             .map_err(|e| format!("No default output config: {e}"))?;
         let format = sup.sample_format();
         let config: StreamConfig = sup.config();
-        let engine = Engine::new(config.sample_rate as f64, status);
+        let sr = config.sample_rate as f64;
+        let engine = Engine::new(sr, status, Some(garbage));
         let xruns = Arc::new(AtomicU64::new(0));
         let x = Arc::clone(&xruns);
         let stream = match format {
@@ -91,6 +97,6 @@ impl Output {
             other => return Err(format!("Unsupported sample format {other:?}")),
         };
         stream.play().map_err(|e| format!("Failed to start output stream: {e}"))?;
-        Ok(Self { _stream: stream, xruns })
+        Ok((Self { _stream: stream, xruns }, sr))
     }
 }

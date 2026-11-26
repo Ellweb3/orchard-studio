@@ -20,3 +20,6 @@ dev_dependencies:
 
 flutter:
   uses-material-design: true
+  assets:
+    - assets/GeneralUser-GS.sf2
+    - assets/GeneralUser-GS-LICENSE.txt

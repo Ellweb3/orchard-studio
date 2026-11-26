@@ -33,7 +33,7 @@ class StudioPage extends StatefulWidget {
   State<StudioPage> createState() => _StudioPageState();
 }
 
-class _StudioPageState extends State<StudioPage> with SingleTickerProviderStateMixin, WidgetsBindingObserver {
+class _StudioPageState extends State<StudioPage> with WidgetsBindingObserver {
   OrchardEngine? _engine;
   Project? _project;
   EngineClock? _clock;
@@ -46,14 +46,25 @@ class _StudioPageState extends State<StudioPage> with SingleTickerProviderStateM
     try {
       final e = OrchardEngine.start();
       final p = Project(e);
-      final clock = EngineClock(e, this);
+      final clock = EngineClock(e);
       p.addListener(() => clock.playing = p.playing);
       _engine = e;
       _project = p;
       _clock = clock;
       p.restore();
+      _loadSoundFont(e, p);
     } on EngineException catch (e) {
       _error = e.message;
+    }
+  }
+
+  Future<void> _loadSoundFont(OrchardEngine e, Project p) async {
+    try {
+      final data = await rootBundle.load('assets/GeneralUser-GS.sf2');
+      await e.loadSoundFont(data.buffer.asUint8List(data.offsetInBytes, data.lengthInBytes));
+      if (mounted) p.soundFontReady();
+    } catch (err) {
+      debugPrint('SoundFont not loaded: $err');
     }
   }
 

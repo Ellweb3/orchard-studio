@@ -1,13 +1,20 @@
 import 'package:flutter/material.dart';
-import 'package:orchard_engine/orchard_engine.dart';
 
 import '../project.dart';
 import 'engine_clock.dart';
+import 'instrument_picker.dart';
+import 'piano_roll.dart';
 import 'theme.dart';
 import 'widgets.dart';
 
 const double kRowHeight = 64;
-const double kRowControlsWidth = 300;
+const double kRowControlsWidth = 350;
+
+void openPianoRoll(BuildContext context, Project p, EngineClock clock, int ch) {
+  Navigator.of(context).push(MaterialPageRoute<void>(
+    builder: (_) => PianoRollPage(project: p, clock: clock, channel: ch),
+  ));
+}
 
 class ChannelRack extends StatelessWidget {
   const ChannelRack({super.key, required this.project, required this.clock});
@@ -36,9 +43,16 @@ class ChannelRack extends StatelessWidget {
                     height: 48,
                     child: OutlinedButton.icon(
                       key: const ValueKey('addChannel'),
-                      onPressed: () => _pickSound(context, (s) => p.addChannel(s)),
+                      onPressed: () async {
+                        final spec = await pickInstrument(context, p.engine);
+                        if (spec == null) return;
+                        p.addChannel(spec);
+                        final ch = p.channels.length - 1;
+                        p.preview(ch);
+                        if (spec.melodic && context.mounted) openPianoRoll(context, p, clock, ch);
+                      },
                       icon: const Icon(Icons.add),
-                      label: const Text('Добавить звук'),
+                      label: const Text('Добавить инструмент'),
                     ),
                   ),
                 ),
@@ -161,23 +175,35 @@ class _ChannelRow extends StatelessWidget {
               onChanged: (v) => p.updateChannel(index, (c) => c.vol = v),
             ),
             const SizedBox(width: 6),
-            Expanded(
-              child: _NameButton(project: p, index: index),
+            Expanded(child: _NameButton(project: p, clock: clock, index: index)),
+            const SizedBox(width: 4),
+            IconButton(
+              key: ValueKey('pr$index'),
+              tooltip: 'Piano roll',
+              icon: const Icon(Icons.piano, size: 24),
+              color: p.hasMelody(index) ? C.green : C.textDim,
+              style: IconButton.styleFrom(backgroundColor: C.panelHi, minimumSize: const Size(44, 46)),
+              onPressed: () => openPianoRoll(context, p, clock, index),
             ),
             const SizedBox(width: 6),
             PeakMeter(level: clock.levels[index], width: 6, height: 44),
             const SizedBox(width: 8),
           ]),
         ),
-        Expanded(child: _StepRow(project: p, clock: clock, ch: index)),
+        Expanded(
+          child: p.hasMelody(index)
+              ? _MelodyPreview(project: p, clock: clock, ch: index)
+              : _StepRow(project: p, clock: clock, ch: index),
+        ),
       ]),
     );
   }
 }
 
 class _NameButton extends StatelessWidget {
-  const _NameButton({required this.project, required this.index});
+  const _NameButton({required this.project, required this.clock, required this.index});
   final Project project;
+  final EngineClock clock;
   final int index;
 
   @override
@@ -190,14 +216,44 @@ class _NameButton extends StatelessWidget {
         key: ValueKey('name$index'),
         borderRadius: BorderRadius.circular(6),
         onTap: () => project.preview(index),
-        onLongPress: () => _channelMenu(context, project, index),
+        onLongPress: () => _channelMenu(context, project, clock, index),
         child: SizedBox(
           height: 46,
           child: Center(
-            child: Text(c.name,
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-                style: const TextStyle(color: C.text, fontSize: 15, fontWeight: FontWeight.w600)),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 4),
+              child: Text(c.name,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(color: C.text, fontSize: 15, fontWeight: FontWeight.w600)),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _MelodyPreview extends StatelessWidget {
+  const _MelodyPreview({required this.project, required this.clock, required this.ch});
+  final Project project;
+  final EngineClock clock;
+  final int ch;
+
+  @override
+  Widget build(BuildContext context) {
+    final notes = project.channelNotes(ch);
+    return GestureDetector(
+      key: ValueKey('preview$ch'),
+      onTap: () => openPianoRoll(context, project, clock, ch),
+      child: RepaintBoundary(
+        child: CustomPaint(
+          size: const Size(double.infinity, kRowHeight),
+          painter: NotePreviewPainter(
+            notes: notes,
+            ticks: project.patternTicks,
+            playhead: clock.step,
+            version: Object.hashAll(notes.map((n) => Object.hash(n.pos, n.len, n.key))),
           ),
         ),
       ),
@@ -227,37 +283,34 @@ class _StepRowState extends State<_StepRow> {
   @override
   Widget build(BuildContext context) {
     final p = widget.project;
+    final ch = widget.ch;
+    final on = [for (var s = 0; s < _len(); s++) p.stepOn(ch, s)];
     return LayoutBuilder(builder: (context, box) {
       final w = box.maxWidth;
       return GestureDetector(
-        key: ValueKey('steps${widget.ch}'),
+        key: ValueKey('steps$ch'),
         behavior: HitTestBehavior.opaque,
         onTapUp: (d) {
           final i = _index(d.localPosition.dx, w);
-          p.setStep(widget.ch, i, p.step(widget.ch, i) == 0);
+          p.setStep(ch, i, !p.stepOn(ch, i));
         },
         onHorizontalDragStart: (d) {
           final i = _index(d.localPosition.dx, w);
-          _paint = p.step(widget.ch, i) == 0;
+          _paint = !p.stepOn(ch, i);
           _last = i;
-          p.setStep(widget.ch, i, _paint);
+          p.setStep(ch, i, _paint);
         },
         onHorizontalDragUpdate: (d) {
           final i = _index(d.localPosition.dx, w);
           if (i != _last) {
             _last = i;
-            p.setStep(widget.ch, i, _paint);
+            p.setStep(ch, i, _paint);
           }
         },
         child: RepaintBoundary(
           child: CustomPaint(
             size: Size(w, kRowHeight),
-            painter: _StepPainter(
-              steps: p.steps[p.pattern][widget.ch],
-              length: _len(),
-              playhead: widget.clock.step,
-              version: Object.hashAll(p.steps[p.pattern][widget.ch].take(_len())),
-            ),
+            painter: _StepPainter(on: on, playhead: widget.clock.step, version: Object.hashAll(on)),
           ),
         ),
       );
@@ -266,69 +319,34 @@ class _StepRowState extends State<_StepRow> {
 }
 
 class _StepPainter extends CustomPainter {
-  _StepPainter({required this.steps, required this.length, required this.playhead, required this.version})
-      : super(repaint: playhead);
-  final List<int> steps;
-  final int length;
+  _StepPainter({required this.on, required this.playhead, required this.version}) : super(repaint: playhead);
+  final List<bool> on;
   final ValueNotifier<int> playhead;
   final int version;
 
   @override
   void paint(Canvas canvas, Size size) {
+    final length = on.length;
     final cell = size.width / length;
     final gap = cell > 30 ? 4.0 : 2.0;
     final h = size.height - 12;
     final cur = playhead.value;
     for (var i = 0; i < length; i++) {
-      final on = steps[i] > 0;
       final groupB = (i ~/ 4).isOdd;
-      final r = RRect.fromRectAndRadius(
-        Rect.fromLTWH(i * cell + gap / 2, 6, cell - gap, h),
-        const Radius.circular(5),
-      );
-      Color color = on ? C.stepOn : (groupB ? C.stepOffB : C.stepOffA);
-      if (i == cur) color = on ? C.playhead : Color.lerp(color, C.playhead, 0.35)!;
+      final r = RRect.fromRectAndRadius(Rect.fromLTWH(i * cell + gap / 2, 6, cell - gap, h), const Radius.circular(5));
+      Color color = on[i] ? C.stepOn : (groupB ? C.stepOffB : C.stepOffA);
+      if (i == cur) color = on[i] ? C.playhead : Color.lerp(color, C.playhead, 0.35)!;
       canvas.drawRRect(r, Paint()..color = color);
-      if (!on) {
-        // inner shade for a "pad" look
-        canvas.drawRRect(r.deflate(3), Paint()..color = Colors.black.withValues(alpha: 0.12));
-      }
+      if (!on[i]) canvas.drawRRect(r.deflate(3), Paint()..color = Colors.black.withValues(alpha: 0.12));
     }
   }
 
   @override
-  bool shouldRepaint(_StepPainter o) => o.version != version || o.length != length || o.steps != steps;
+  bool shouldRepaint(_StepPainter o) => o.version != version || o.on.length != on.length;
 }
 
-// -------------------------------------------------------------- sheets
-Future<void> _pickSound(BuildContext context, void Function(int sample) onPick) {
-  return showModalBottomSheet(
-    context: context,
-    backgroundColor: C.panel,
-    builder: (c) => SafeArea(
-      child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Wrap(spacing: 12, runSpacing: 12, children: [
-          for (var s = 0; s < kSounds.length; s++)
-            SizedBox(
-              width: 170,
-              height: 64,
-              child: FilledButton.tonal(
-                key: ValueKey('sound$s'),
-                onPressed: () {
-                  onPick(s);
-                  Navigator.pop(c);
-                },
-                child: Text(kSounds[s], style: const TextStyle(fontSize: 17)),
-              ),
-            ),
-        ]),
-      ),
-    ),
-  );
-}
-
-Future<void> _channelMenu(BuildContext context, Project p, int index) {
+// -------------------------------------------------------------- channel menu
+Future<void> _channelMenu(BuildContext context, Project p, EngineClock clock, int index) {
   return showModalBottomSheet(
     context: context,
     backgroundColor: C.panel,
@@ -338,24 +356,30 @@ Future<void> _channelMenu(BuildContext context, Project p, int index) {
         child: Padding(
           padding: const EdgeInsets.all(20),
           child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
-            Text(ch.name, style: const TextStyle(fontSize: 20, fontWeight: FontWeight.w700)),
-            const SizedBox(height: 12),
-            const Text('Звук', style: TextStyle(color: C.textDim)),
-            const SizedBox(height: 6),
-            Wrap(spacing: 8, runSpacing: 8, children: [
-              for (var s = 0; s < kSounds.length; s++)
-                ChoiceChip(
-                  label: Text(kSounds[s]),
-                  selected: ch.sample == s,
-                  onSelected: (_) {
-                    p.updateChannel(index, (c) {
-                      if (c.name == kSounds[c.sample]) c.name = kSounds[s];
-                      c.sample = s;
-                    });
+            Row(children: [
+              Expanded(child: Text(ch.name, style: const TextStyle(fontSize: 20, fontWeight: FontWeight.w700))),
+              FilledButton.tonalIcon(
+                key: const ValueKey('menuInstrument'),
+                onPressed: () async {
+                  final spec = await pickInstrument(context, p.engine, current: ch.inst);
+                  if (spec != null) {
+                    p.setInstrument(index, spec);
                     p.preview(index);
                     setState(() {});
-                  },
-                ),
+                  }
+                },
+                icon: const Icon(Icons.swap_horiz),
+                label: const Text('Сменить инструмент'),
+              ),
+              const SizedBox(width: 8),
+              FilledButton.tonalIcon(
+                onPressed: () {
+                  Navigator.pop(c);
+                  openPianoRoll(context, p, clock, index);
+                },
+                icon: const Icon(Icons.piano),
+                label: const Text('Piano roll'),
+              ),
             ]),
             const SizedBox(height: 16),
             Text('Высота: ${ch.pitch.round() >= 0 ? '+' : ''}${ch.pitch.round()} полутонов',
